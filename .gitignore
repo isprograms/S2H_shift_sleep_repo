@@ -1,0 +1,32 @@
+# Data: never commit participant-level data. The folders are kept (empty) via
+# .gitkeep so the scripts can write to them after cloning.
+/data/*
+!/data/.gitkeep
+/raw_data/*
+!/raw_data/.gitkeep
+
+# Model objects and results (fitted brms models embed the data they were fitted on)
+/models/
+/results/
+
+# Safety net: data and model file types, wherever they are
+*.rds
+*.RDS
+*.rda
+*.RData
+*.rdata
+*.csv
+*.sav
+*.dta
+
+# Knitted reports (may embed rendered data/tables)
+*.html
+*.nb.html
+
+# R / RStudio session state (can cache data in memory or console output)
+.Rhistory
+.RData
+.Rproj.user/
+
+# OS
+.DS_Store

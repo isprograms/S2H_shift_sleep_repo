@@ -1,0 +1,491 @@
+---
+title: "Level 1 clustering (Von Mises)"
+author: "Isabel Santonja"
+date: "2025-08-08"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r load_libraries_and_data}
+# Load packages
+library(dplyr)
+library(circular)
+library(movMF)
+library(lsa)         # for cosine distance
+library(cluster)     # for silhouette
+library(mclust)      # for ARI
+library(clue)  # for solve_LSAP function (Linear Sum Assignment Problem)
+library(hms)
+
+# Load function
+source(file = here::here("functions", "specific_cluster.R"))
+source(file = here::here("functions", "plots.R"))
+
+#Load  data
+schedules <- readRDS(file = here::here("data", "circular_schedules"))
+
+# Set seed for reproducibility
+set.seed(143) # For reproducibility
+```
+
+## Data preparation
+
+```{r 1.1-dataset_preparation, message = FALSE}
+# Wrangle data
+schedules_cluster <- schedules|> 
+  ungroup() |>
+  mutate(row_id = row_number()) |> # Add row IDs to track original rows
+  mutate(
+    shift_start_circular = circular(
+      shift_start_angle, 
+      units = "radians", 
+      template = "clock24"
+    ),
+    shift_end_circular   = circular(
+      shift_end_angle, 
+      units = "radians", 
+      template = "clock24"
+    ),
+    is_night_shift_num = as.numeric(is_night_shift)
+  )
+
+rm(schedules)
+```
+
+Mixtures of von Mises-Fisher (VMF) model-based clustering requires the data to lie on the unit sphere (VMF measures direction, not magnitude). Thus, before running the clustering algorithm, I will normalize the sines and cosines (clustering values), ensuring that **each row has length 1**.
+
+```{r 1.2-prepare-clustering-matrix}
+# Normalize data
+## Define function with safety check
+normalize_safe <- function(x) {
+  norms <- sqrt(rowSums(x^2)) # calculate eucledian length for each row (radius)
+  
+  valid <- norms > 0 # Avoid divisions by 0
+  
+  x[valid, ] <- x[valid, ] / norms[valid] # divide by eucledian length, 
+                                          # so each row length = 1
+  return(x[valid, , drop = FALSE])
+}
+
+## Apply function to start and end times (clustering variables)
+schedules_red <- schedules_cluster |>
+  select(matches(c("sin", "cos")))
+
+circular_data_norm <- normalize_safe(schedules_red)
+circular_matrix <- as.matrix(circular_data_norm)
+```
+
+## Fit VMF based clusters with k \< 10
+
+```{r 2.1-function-vmf}
+# Function to fit VMF model without crushing
+fit_vmf_safe <- function(data, k, nruns = 5) {
+  tryCatch({ # avoid that function stops if model does not converge
+    movMF(data, k = k, nruns = nruns) # increase nr. of runs to avoid being stuck in local maxima
+  }, error = function(e) {
+    message("VMF did not converge for k = ", k)
+    return(NULL)
+  })
+}
+```
+
+### Select best number of components
+
+#### Bayesian Information Criterion (BIC) scores
+
+BIC (Bayesian Information Criterion) is a score that balances **model fit** (higher likelihood) against **model complexity** (number of parameters), with lower values indicating a better trade-off. The figure below shows a comparison of the scores of the different cluster solutions.
+
+```{r 2.2-fit-vmf-models}
+# Set clustering parameters and list to store results
+max_k <- 10 # max nr of clusters
+results <- list()
+bic_scores <- numeric(max_k) # save BIC scores to compare later
+
+# Fit VMF models for 1-10 components
+for (k in 1:max_k) {
+  model <- fit_vmf_safe(circular_matrix, k)
+  if (is.null(model)) {
+    bic_scores[k] <- NA
+    results[[k]] <- NULL
+    next
+  }
+  ll <- as.numeric(logLik(model))
+  num_params <- k * ncol(circular_matrix)  # rough param count
+  bic_scores[k] <- -2 * ll + log(nrow(circular_matrix)) * num_params
+  results[[k]] <- model
+}
+```
+
+```{r 2.3-bic-plot}
+# Update max number of components
+max_k <- length(results)
+
+# Draw plot with BIC scores
+plot(1:max_k, bic_scores, type = "b", xlab = "k", ylab = "BIC")
+```
+
+The lowest BIC score correspond to the solution with `` `r which.min(bic_scores)` `` components.
+
+#### Silhouette scores
+
+The silhouette score is **a metric used to evaluate the quality of clustering in unsupervised machine learning**. It measures how well each data point fits within its assigned cluster compared to other clusters. A higher silhouette score indicates better-defined and separated clusters. 
+
+```{r 2.4-calculate-silhouette scores}
+# Create vector to store scores
+silhouette_scores <- numeric(max_k)
+
+# Compute cosine distance
+cos_dist <- proxy::dist(circular_matrix, method = function(x, y) 1 - cosine(x, y))
+
+# Calculate silhouette score for all the solutions
+for (k in 2:max_k) {
+  model <- results[[k]]
+  if (is.null(model)) {
+    silhouette_scores[k] <- NA
+    next
+  }
+  # Assign each observation to a cluster
+  clust_labels <- predict(model, circular_matrix)
+  
+  # Calculate silhouette score for each point
+  sil <- silhouette(clust_labels, cos_dist)
+  # Calculate average silhouette for each solution
+  silhouette_scores[k] <- mean(sil[, 3])
+}
+```
+
+```{r 2.5-plot-silhouette-score}
+# Plot scores vs nr of components
+plot(1:max_k, silhouette_scores, type = "b", xlab = "k", ylab = "Avg Silhouette (cosine)")
+```
+
+The highest silhouette score correspond to the solution with `` `r which.max(silhouette_scores)` `` components (silhouette score \>0.76, indicating strong structure). But the solutions with 5 (local maximum), 6, 9 and 10 (score \> 0.60) seem to have also a good structure.
+
+#### Cross-validated log likehood
+
+Next, I will manually calculate the log likehood for each solution, since there is no built-in function for VMF models.
+
+For that, first the normalisation constant needs to be computed (function `vmf_const()).` This ensures the density integrates to 1 over the hypersphere (i.e. that the probabilities add up to 100% and no more). Then, I defined a function that loops over folds (nearly equal subsets of the data) and evaluates how well a vMF mixture with `k` components generalizes. In short, this chunk performs *manual k-fold cross-validation for vMF mixture models* by directly evaluating the probability densities on unseen folds using the analytical vMF formula. This ensures full control over how likelihoods are computed.
+
+```{r 2.6-log-likehood-comp}
+# Normalization constant for vMF
+vmf_const <- function(kappa, p) {
+  (kappa^(p/2 - 1)) / ((2 * pi)^(p/2) * besselI(kappa, p/2 - 1))
+}
+
+# Define cross-validation function
+cv_loglik <- function(data, k, folds = 5) {
+  n <- nrow(data)
+  p <- ncol(data)
+  # Split into folds
+  idx <- sample(rep(1:folds, length.out = n))
+  ll_values <- numeric(folds)
+  
+  for (fold in 1:folds) {
+    train <- data[idx != fold, , drop = FALSE]
+    test <- data[idx == fold, , drop = FALSE]
+    
+    model <- fit_vmf_safe(train, k)
+    if (is.null(model)) {
+      ll_values[fold] <- NA
+    } else {
+      alpha <- model$alpha # frequency of each cluster
+      theta <- model$theta  # columns: unit mean directions * kappa (theta is a vector
+                            # indicating direction&strenght of cluster centre
+       # Ensure dimensions are p × k
+      if (nrow(theta) != ncol(data)) {
+        theta <- t(theta) # transpose matrix
+      }
+      
+      # Extract kappa (norm of each theta column)
+      kappa <- sqrt(colSums(theta^2)) # measures cluster "concentration" (larger kappa =
+                                      # tighter cluster)
+      mu <- sweep(theta, 2, kappa, FUN = "/") # unit vector pointing to cluster center
+      
+      # Compute component densities for each test observation
+      comp_dens <- sapply(1:k, function(j) {
+        const <- vmf_const(kappa[j], p)
+        exp_term <- exp(kappa[j] * (test %*% mu[, j])) # vector of length n
+        const * exp_term
+      })
+      
+      # Mixture density = weighted sum across components
+      mix_dens <- comp_dens %*% alpha # weighted sum of component densities
+      
+      # Log-likelihood for this fold
+      ll_values[fold] <- sum(log(mix_dens))
+    }
+  }
+  mean(ll_values, na.rm = TRUE)
+}
+
+cv_scores <- sapply(1:max_k, function(k) cv_loglik(circular_matrix, k))
+plot(1:max_k, cv_scores, type = "b", xlab = "k", ylab = "CV logLik")
+```
+
+With the exception of the solutions with 4 components, the log likehood values generally increase as the number of components increases until k=7. From this point on, there are also some convergence issues.
+
+#### Cluster stability
+
+To examine the stability of the cluster solutions, I will calculate the average Adjusted Range Index (ARI) for the solutions with 1-10 components. ARI quantifies the similarity between two partitions.
+
+In order to do so, I will compare the cluster solutions generated for the original dataset for 2-9 components with 20 solutions generated for the same number of components from bootstrapped samples, and calculate the average.
+
+```{r 2.7-ari}
+# Define parameters
+components_to_test <- 2:10
+n_runs <- 20
+
+# Storage for ARI scores and cluster centers
+ari_results <- list()
+cluster_centers <- list()
+
+# Fit models with k between 2:10 in bootstrapped samples
+for(k in components_to_test) {
+  # Set matrix and list for storage in the following loop
+  cluster_assignments <- matrix(NA, nrow = nrow(circular_matrix), ncol = n_runs)
+  centers_list <- vector("list", n_runs) # use vector() to set length
+  
+  # Fit models with k between 1:10 in bootstrapped samples
+  for(run in 1:n_runs) {
+    boot_sample <- circular_matrix[sample(1:nrow(circular_matrix), replace = TRUE),] 
+    boot_sample <- boot_sample / sqrt(rowSums(boot_sample^2))
+
+    fit <- tryCatch(
+      movMF(
+        boot_sample, 
+        k = k, 
+        control = list(tol = 1e-4, maxit = 1000)), # limits for iteration
+      error = function(e) NULL
+    )
+    
+    if (is.null(fit)) { # so loop continues even if model does not converge
+      cat("EM did not converge for k =", k, "run =", run, "\n")
+      next
+    }
+
+    cluster_assignments[, run] <- predict(fit, circular_matrix)
+    centers_list[[run]] <- fit$theta
+  }
+
+  # Remove NULL fits
+  valid_runs <- which(!sapply(centers_list, is.null))
+  
+  
+  if (length(valid_runs) < 2) {
+    cat("Not enough valid runs for k =", k, "- skipping ARI calculation\n")
+    ari_results[[as.character(k)]] <- NA
+    cluster_centers[[as.character(k)]] <- NULL
+    next
+  }
+  
+  centers_list <- centers_list[valid_runs]
+  cluster_assignments <- cluster_assignments[, valid_runs, drop = FALSE]
+  
+  # Align clusters across runs
+  ref_centers <- results[[k]]$theta
+  ref_unit <- ref_centers / sqrt(rowSums(ref_centers^2))
+  
+  for (idx in 2:length(valid_runs)) {
+    current_centers <- centers_list[[idx]]   # already reduced list so idx is safe
+    
+    # Skip if current_centers is NULL
+    if(is.null(current_centers)) next
+    
+    # Normalize each center to unit length
+    current_unit <- current_centers / sqrt(rowSums(current_centers^2))
+    
+    # Compute distance matrix based on unit vectors
+    cost_matrix <- as.matrix(dist(rbind(ref_unit, current_unit)))[1:k, (k+1):(2*k)]
+
+     # Check for any NA/Inf in cost_matrix
+    if(any(is.na(cost_matrix) | is.infinite(cost_matrix))) next
+    
+    if(nrow(current_centers) != k) next
+    
+    perm <- solve_LSAP(cost_matrix)
+    centers_list[[idx]] <- current_centers[perm, , drop = FALSE]
+    cluster_assignments[, idx] <- perm[cluster_assignments[, idx]]
+    }
+
+  # Compute ARI matrix for valid runs only
+  ari_matrix <- matrix(NA, nrow = length(valid_runs), ncol = length(valid_runs))
+  for(i in 1:(length(valid_runs)-1)) {
+    for(j in (i+1):length(valid_runs)) {
+      ari_matrix[i,j] <- adjustedRandIndex(cluster_assignments[,i], cluster_assignments[,j])
+      ari_matrix[j,i] <- ari_matrix[i,j]
+    }
+  }
+  ari_matrix
+  mean_ari <- mean(ari_matrix[upper.tri(ari_matrix)], na.rm = TRUE)
+  cat("Average ARI for", k, "clusters:", round(mean_ari, 3), "\n")
+
+  ari_results[[as.character(k)]] <- mean_ari
+  cluster_centers[[as.character(k)]] <- centers_list
+}
+```
+
+```{r 2.8-ari-plot}
+# Add first element (NA) to ari results list to be alighned with the components
+ari_results <- append(NA, ari_results)
+
+# Plot
+plot(1:max_k, ari_results, type = "b", xlab = "k", ylab = "Average ARI")
+```
+
+The largest average ARIs correspond to k = 5 and k = 9 components. For all solutions of 4-8 components, average ARI was \> 0.75. However, some convergence issues were observed for k \> 6.
+
+#### Summary
+
+```{r 2.9-selection-summary}
+# Generate SF2
+## Define component vector
+components <- 1:max_k
+
+## Remove problematic component 4 for log-likelihood (prob. an outlier)
+log_likelihood_clean <- ifelse(components == 4, NA, cv_scores)
+
+## Plot all metrics
+pdf(here::here("figures", "sfig2.pdf"), width = 4, height = 6)
+
+par(
+  mfrow=c(4,1), # (rows, columns)
+ mar=c(4,4,3,1) #bottom, left, top and right margins
+  )
+
+plot(components, bic_scores[1:max_k], type="b", pch=19, col="red",
+     ylab="BIC", xlab="")
+mtext("A)", side = 3, line = 1, adj = 0, font = 2, cex = 1.0)
+abline(v = components[which.min(bic_scores)], col="red", lty=2)
+
+plot(components, silhouette_scores[1:max_k], type="b", pch=19, col="green",
+     ylab="Silhouette Score", xlab="")
+mtext("B)", side = 3, line = 1, adj = 0, font = 2, cex = 1.0)
+abline(v = components[which.max(silhouette_scores)], col="green", lty=2)
+
+plot(components, log_likelihood_clean, type="b", pch=19, col="blue",
+     ylab="Log-Likelihood", xlab="")
+mtext("C)", side = 3, line = 1, adj = 0, font = 2, cex = 1.0)
+abline(v = components[which.max(log_likelihood_clean)], col="blue", lty=2)
+
+plot(components, ari_results, type="b", pch=19, col="magenta",
+     ylab="Average ARI", xlab="k")
+mtext("D)", side = 3, line = 1, adj = 0, font = 2, cex = 0.9)
+     
+abline(v = components[which.max(ari_results)], col="magenta", lty=2)
+
+dev.off()
+```
+
+Taken all together:
+
+- **BIC** decreases steadily until \~6 and then flattens. The “best” (lowest) BIC is at 9–10 components, but the improvement after \~6 is minimal.
+
+- Peak silhouette score is at **k = 3**. After that, silhouette decreases, meaning cluster separation gets worse, but there is a local maximum at k = 5.
+
+- Log-likehood increases with k, but the largest gains are up to **\~6–7 clusters**, after which the curve levels off.
+
+- ARI is relatively high from 3 to 6, with a peak at **k = 9**, suggesting **stability is best around 9 clusters**.
+
+Overall, the most informative solutions seem to be the ones with **3, 5/6 and 9** components:
+
+- **k = 3** for interpretability and strongest separation.
+
+- **k = 5–6** as a balance between parsimony (BIC) and likelihood. However, in previous runs excluding subjects with missing data in some of the level 2 covariates, k = 5 had better metrics than k = 6. So, I would rather test k = 5.
+
+- **k = 9** as the stablest solution (higher ARI).
+
+Thus, I will check the solutions with k = 5 and k = 9 groups and the solution with **k = 3** as a “simpler model” for interpretability.
+
+### 3 component (baseline) solution
+
+```{r 3.1-3k-solution}
+# Explore cluster features
+cluster_k3v <- predict(results[[3]], circular_matrix)
+
+schedules_cluster <- schedules_cluster|>
+  mutate(cluster_k3 = cluster_k3v)
+
+cluster_schedules_summary(schedules_cluster, cluster_k3) %>% 
+  mutate(across(mean_start_hour:sd_end_hour, ~as_hms(round(.*3600)))) # To avoid decimals by seconds
+```
+
+```{r 3.2-3k-plot}
+# Name clusters according to characteristics
+schedules_cluster <- schedules_cluster %>% 
+  mutate(cluster_k3 = factor(case_when(
+    cluster_k3 == 1 ~ "Modified night shifts",
+    cluster_k3 == 3 ~ "Early shifts",
+    cluster_k3 == 2 ~ "Late shifts"
+  )))
+
+# Generate dumbbell style plot to visualise clusters
+schedules_plot_coloured(schedules_cluster, cluster_k3)+
+  guides(color=guide_legend(title="Shift cluster"))
+
+ggsave(filename = here::here("figures", "3kplot.pdf"))
+```
+
+### 5 component solution
+
+```{r 3.3-5k-solution}
+# Explore cluster features
+cluster_k5v <- predict(results[[5]], circular_matrix)
+
+schedules_cluster <- schedules_cluster|>
+  mutate(cluster_k5 = cluster_k5v)
+
+cluster_schedules_summary(schedules_cluster, cluster_k5)%>% 
+  mutate(across(mean_start_hour:sd_end_hour, ~as_hms(round(.*3600))))
+```
+
+```{r 3.4-5k-plot}
+# Name clusters according to characteristics
+schedules_cluster <- schedules_cluster %>% 
+  mutate(cluster_k5 = factor(case_when(
+    cluster_k5 == 2 ~	"Evening shifts",
+    cluster_k5 == 5 ~	"Long day shifts",
+    cluster_k5 == 4 ~	"Long evening shifts",
+    cluster_k5 == 1 ~	"Night shifts",
+    cluster_k5 == 3 ~	"Day shifts"
+  )))
+
+# Generate dumbbell style plot to visualise clusters
+schedules_plot_coloured(schedules_cluster, cluster_k5) +
+  scale_colour_brewer(palette = "Set2")+ # high-contrast
+  guides(color=guide_legend(title="Shift cluster"))
+
+ggsave(filename = here::here("figures", "5kplot.pdf"))  
+  
+```
+
+### 9 component solution
+
+```{r 3.7-9k-solution}
+# Explore cluster features
+cluster_k9v <- predict(results[[9]], circular_matrix)
+
+schedules_cluster <- schedules_cluster|>
+  mutate(cluster_k9 = factor(cluster_k9v))
+
+cluster_schedules_summary(schedules_cluster, cluster_k9)%>% 
+  mutate(across(mean_start_hour:sd_end_hour, ~as_hms(round(.*3600))))
+```
+
+In this solution, some cluster groups have few observations and some of the categories are very similar (2 and 7). Thus, I will proceed with the k = 5 solution.
+
+## Save data
+
+```{r}
+saveRDS(schedules_cluster, file= here::here("data", "schedules_cluster.RDS"))
+saveRDS(results, file = here::here("data", "cluster_solutions.RDS"))
+```
+
+Session Information
+
+```{r}
+sessionInfo()
+```

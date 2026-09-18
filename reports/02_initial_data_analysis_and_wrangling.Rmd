@@ -1,0 +1,1273 @@
+---
+title: "Initial data analysis"
+author: "Isabel Santonja"
+date: "2025-09-18"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r 0.1-load-data-and-libraries, message = FALSE}
+#Load libraries
+library(tidyverse)
+library(lubridate)
+library(hms)
+library(table1)
+library(scales)          # For time scales in ggplot
+library(GGally) 
+library(patchwork)
+library(magrittr)
+
+#Load data
+data <- as_tibble(readRDS(file = here::here("raw_data", "data_edited.RDS")))
+shifts_long <- readRDS(file = here::here("data", "shift_schedules_long_edited.rds"))
+
+#Load functions
+source(here::here("functions", "time_variables.R")) # for rounding times
+source(here::here("functions", "schedules_description.R")) # for shift description tables
+source(here::here("functions", "plots.R")) # for customized plots
+```
+
+## Statistical analyses requirements
+
+### Van Mises-Fisher clustering
+
+- Conversion of times to radians and decomposition in **sine and cosine components**.
+
+- **Unit Hypersphere Constraint**: Every data vector must have a normalized length of exactly 1.
+
+- **Continuous Directional Data**: The data must represent directions or orientations rather than magnitude (as in time of day variables, considering time cyclic).
+
+### Bayesian logistic regression
+
+- Binary outcome
+
+- Standardise continuous predictors
+
+- No sparse levels for categorical predictors
+
+- No severe multicollinearity
+
+## Models
+
+- **Model 0**: unadjusted
+
+- **Model 1**: age- and gender-adjusted
+
+- **Model 2**: Model 1 + chronotype, country of residence, education, income satisfaction, marital status, BMI, alcohol consumption and smoking status
+
+- **Model 3** (mutually adjusted model for shift schedule composition association analysis, excluding interrelated variables): Model 2 + years worked on night shifts and total weekly working hours
+
+- **Model 4** (mutually adjusted model for classic metrics association analysis, excluding interrelated variables): M2 + *years worked on night shifts*, *schedule type* and *weekly working hours*
+
+Additionally, models will be stratified by **chronotype**.
+
+## Explore missingness
+
+### Shift schedules
+
+As information on schedules is stored in different variables, I will explore item missingness in:
+
+1.  The first shift start variables (completely missing).
+
+2.  The first shift frequency variable (partially missing).
+
+3.  Missingness in the first question after the schedules table (*oq_shift_rotation*), as an indicator for respondents who might have stopped answering the questionnaire at some point of the table (maybe missing).
+
+```{r 1.1-schedules-missingness}
+# Create categorical variable to explore missingness and select variables to
+# define different groups of missingness
+schedules_missingness <- data %>% 
+  mutate(
+    schedules_missing = case_when(
+      is.na(oq_st1_start) ~ "Completely",
+      is.na(oq_st1_num) ~ "Partially",
+      is.na(oq_shift_rotation) ~ "Maybe",
+      .default = "Not missing"
+      )
+    ) %>% 
+  select(
+    oq_age, gender, oq_bmi, education, oq_work_hours, night_shift_history, 
+    work_sector, schedules_missing
+    )
+
+# Tabulate missingness groups' basic characteristics
+table1(~ oq_age + gender + oq_bmi + education + oq_work_hours + 
+         night_shift_history + work_sector | schedules_missing, 
+       schedules_missingness)
+```
+
+Those for which schedules information is completely missing were slightly older and were more likely to work in the "trade, logistics, transport" or "other" sectors and have lower education. Those with complete information were younger, more likely to be females, to work night shifts, to work in the health sector and had higher BMI. Always day workers and males were more likely to provide only partial information on schedules
+
+Below there is a comparison between those with "clean" schedule information and those with missing schedules or implausible information.
+
+```{r 1.2-schedules-clean-missing}
+# Extract ids from schedules dataset
+complete_shift_ids <- shifts_long %>% 
+  select(id) %>% 
+  pull() %>% 
+  unique()
+
+# Extract ids of shifts longer than 25h
+too_long_shift_ids <- shifts_long %>% 
+  filter(shift_duration_clean > 25.0) %>% 
+  select(id) %>% 
+  pull() %>% 
+  unique()
+
+# Extract ids of shifts longer than 25h
+too_short_shift_ids <- shifts_long %>% 
+  filter(shift_duration_clean < 3.0) %>% 
+  select(id) %>% 
+  pull() %>% 
+  unique()
+
+# Create variable in full dataset to identify those
+data <- data %>% 
+  mutate(
+    clean_schedules = if_else(
+      id %in% complete_shift_ids, "Clean", "Missing"
+    )
+  ) %>% 
+  mutate(night_shifts_updated = as.factor(if_else(
+    night_shift_reported,
+    "Current night shift worker",
+    night_shift_history
+  ))) %>% 
+  mutate(night_shifts_updated = factor(
+    night_shifts_updated,
+    levels = c("Always day worker", 
+               "Former night shift worker", 
+               "Current night shift worker")
+  ))
+
+# Tabulate characteristics
+table1(~ oq_age + gender + oq_bmi + education + oq_work_hours + 
+         night_shift_history + work_sector | clean_schedules, 
+       data)
+```
+
+Similarly, those for which no clean information on schedules is available were slightly older and report lower education status. They were also more likely to be female and not to be working night shifts at the moment.
+
+### Sleep duration
+
+To explore missingness in sleep duration, I will consider those who have missing values for sleep duration on workdays (i.e. missings in sleep durations for the first schedule) and on free days only.
+
+```{r 1.3-sleep-duration-missingness}
+# Create categorical variable to explore missingness and select variables to
+# define different groups of missingness
+sleep_duration_missingness <- data %>% 
+  mutate(
+    sleep_duration_missing = case_when(
+      (is.na(oq_wd_sleep_duration)& is.na(oq_es_sleep_duration) &
+         is.na(oq_ls_sleep_duration) & is.na(oq_ns_sleep_duration))
+               ~ "Workdays missing",
+      is.na(oq_wf_dw_sleep_duration) & is.na(oq_wf_sleep_duration) 
+            ~ "Days off missing only",
+      .default = "No missings"
+    )) %>% 
+  select(
+    oq_age, gender, oq_bmi, education, oq_work_hours, night_shift_history, 
+    work_sector, sleep_duration_missing
+    )
+
+# Tabulate missingness groups' basic characteristics
+table1(~ oq_age + gender + oq_bmi + education + oq_work_hours + 
+         night_shift_history + work_sector | sleep_duration_missing, 
+       sleep_duration_missingness)
+```
+
+Respondents with missing values in sleep duration variables were older, more likely to be female, had higher BMI, reported lower education levels. Subjects with completely missing sleep duration information were more likely to be current or former night shift workers and work in the health care or trade, logistic and transport sector.
+
+### Sleep quality
+
+To explore missingness in sleep quality, I will consider those who have missing values for sleep quality on workdays (i.e. missings in sleep quality variables for the first/only schedule) and on free days only.
+
+```{r 1.4-sleep-quality-missingness}
+# Create categorical variable to explore missingness and select variables to
+# define different groups of missingness
+sleep_quality_missingness <- data %>% 
+  mutate(
+    sleep_quality_missing = case_when(
+      (is.na(oq_wd_sleep_qual)& is.na(oq_es_sleep_qual) &
+         is.na(oq_ls_sleep_qual) & is.na(oq_ns_sleep_qual))
+               ~ "Workdays missing",
+      is.na(oq_wf_dw_sleep_qual) & is.na(oq_wf_sleep_qual) 
+            ~ "Days off missing only",
+      .default = "No missings"
+    )) %>% 
+  select(
+    oq_age, gender, oq_bmi, education, oq_work_hours, night_shift_history, 
+    work_sector, sleep_quality_missing
+    )
+
+# Tabulate missingness groups' basic characteristics
+table1(~ oq_age + gender + oq_bmi + education + oq_work_hours + 
+         night_shift_history + work_sector | sleep_quality_missing, 
+       sleep_quality_missingness)
+```
+
+Participants with complete information on sleep quality were younger, more likely to be young and had higher education levels.
+
+### Chronic insomnia
+
+```{r 1.5-insomnia-missingness}
+# Create categorical variable to explore missingness and select variables to
+# define different groups of missingness
+insomnia_missingness <- data %>% 
+  mutate(
+    insomnia_missing = case_when(
+      is.na(chronic_insomnia)
+               ~ "Missing",
+      .default = "Not missing"
+    )) %>% 
+  select(
+    oq_age, gender, oq_bmi, education, oq_work_hours, night_shift_history, 
+    work_sector, insomnia_missing
+    )
+
+# Tabulate missingness groups' basic characteristics
+table1(~ oq_age + gender + oq_bmi + education + oq_work_hours + 
+         night_shift_history + work_sector | insomnia_missing, 
+       insomnia_missingness)
+```
+
+Those with missing information for the calculation of the insomnia variable were older, more likely to be female, had higher BMI, reported lower education levels and were more likely not to be working night shifts at the moment.
+
+### Analysis dataset
+
+For the analysis, I will only include respondents with complete shift information (i.e. those included in `shifts_long` and with information on years worked on night shifts), sleep, age, gender and night shift history, and exclude those who might have answered the survey randomly or report shifts longer than 25h or shorter than 3h.
+
+```{r 1.6-reduce-dataset}
+# Filter observations
+data_analysis <- data %>% 
+  filter(id %in% complete_shift_ids) %>% 
+  filter(!(id %in% too_long_shift_ids |
+             id %in% too_short_shift_ids|
+           oq_suspect_observations)) %>% 
+  filter(!(is.na(years_worked_ns_cat) & 
+             night_shift_history != "Always day worker" )) %>% 
+  filter(!is.na(chronic_insomnia) &
+          !(is.na(oq_wd_sleep_duration)& is.na(oq_es_sleep_duration) &
+         is.na(oq_ls_sleep_duration) & is.na(oq_ns_sleep_duration)) &
+           !(is.na(oq_wf_dw_sleep_duration) & is.na(oq_wf_sleep_duration)) &
+           !(is.na(oq_wd_sleep_qual)& is.na(oq_es_sleep_qual) &
+                is.na(oq_ls_sleep_qual) & is.na(oq_ns_sleep_qual)) &
+           !(is.na(oq_wf_dw_sleep_qual) & is.na(oq_wf_sleep_qual)))
+```
+
+Of the, 8102 respondents, n= 7116 provided complete information on shift schedules. Of those, n = 97 respondents only reported shifts lasting more than 25h and n= 31 shorter than 3h (2 of which also reported shifts \> 25h) and were excluded from the analysis, since they probably sleep during working hours and the survey was not designed to capture this. In addition, n = 613 respondents who did not provide complete information on shift work metrics, schedules or sleep or who might have filled the questionnaire randomly were excluded, resulting in a sample size of 6,377.
+
+```{r 1.7-clean-environment, echo = FALSE}
+# Select objects to keep
+keep_df <- c("data_analysis", "shifts_long")
+
+## Pick functions
+all_objs <- ls()
+is_func <- sapply(all_objs, function(x) is.function(get(x)))
+
+keep <- all_objs[is_func | all_objs %in% keep_df]
+
+# Remove everything else
+rm(list = setdiff(all_objs, keep))
+rm(all_objs, keep)
+```
+
+### Covariates
+
+#### Age and sex
+
+No missing values in these variables.
+
+#### Country
+
+```{r 1.8-missings-country}
+table(data_analysis$country, useNA = "ifany")
+```
+
+There are 99 missing values. I suggest creating a new category, or group them with "other" category. The category of "Other" will be created by grouping together countries with n \< 10.
+
+```{r 1.9-regroup-country-categories}
+# Define new country variable with larger categories
+data_analysis <- data_analysis %>% 
+  mutate(country_grouped = case_when(
+    is.na(country) ~ "Unknown",
+    country %in% c("Ireland", "Lithuania", "Romania", "Latvia", "Estonia") ~ "Other",
+    .default = country
+  )) 
+```
+
+I will also create a new dataset with those with missings in confounders.
+
+```{r 1.10-confounders-missing}
+missing_confounders <- data_analysis %>% 
+  filter(is.na(country))
+```
+
+#### Education
+
+```{r 1.11-missings-education}
+table(data_analysis$education, useNA = "ifany")
+```
+
+There are no missing values, but groups of "Unknown/prefer not to say" and "Basic education not completed" have lower size, so it might be useful to group them together.
+
+```{r 1.12-regroup-education-categories}
+data_analysis <- data_analysis %>% 
+  mutate(education_grouped = case_when(
+    education %in% c("Basic education not completed", 
+                     "Unknown/prefer not to say") 
+    ~ "Other",
+    .default = education
+  ))
+```
+
+#### Marital status
+
+```{r 1.13-missings-marital-status}
+table(data_analysis$marital_status, useNA = "ifany")
+```
+
+There are no missing values, but categories "Widowed/partner has died" will have to be regrouped.
+
+#### Income satisfaction
+
+```{r 1.14-missings-income}
+data_analysis%$%table(income_satisfaction, useNA = "ifany")
+```
+
+There are no missings, but eventually I will need to merge the categories "Finding it very difficult on present income" (n = 341) and "Prefer not to say" (n = 25).
+
+#### Chronotype
+
+```{r 1.15-missings-chronotype}
+data_analysis%$%table(oq_person_type, useNA = "ifany")
+```
+
+There are no missing values for chronotype. I will only convert this variable to categorical.
+
+```{r 1.16-regroup-chronotype-categories}
+data_analysis <- data_analysis %>% 
+  mutate(chronotype = case_when(
+    oq_person_type == 0 ~ "Definitely morning",
+    oq_person_type == 1 ~ "Rather morning",
+    oq_person_type == 2 ~ "Intermediate",
+    oq_person_type == 3 ~ "Rather evening",
+    oq_person_type == 4 ~ "Definitely evening"
+  ))
+```
+
+#### BMI
+
+```{r 1.17-missings-bmi}
+data_analysis%$%summary(oq_bmi)
+```
+
+There are n = 20 missing values. Since missingnes is about 0.28%, I think the best option is to substitute these values using the median. Otherwise, I can exclude them
+
+```{r 1.18-dealing-missings-bmi}
+# Create new variable, imputing missings
+data_analysis <- data_analysis %>% 
+  mutate(bmi_imputed = as.numeric(if_else(
+    is.na(oq_bmi),
+    median(oq_bmi, na.rm = TRUE),
+    oq_bmi
+  )))
+
+# Add missings in BMI to missing dataset
+missing_confounders2 <- data_analysis %>% 
+  filter(is.na(oq_bmi))
+
+missing_confounders <- missing_confounders %>% 
+  bind_rows(missing_confounders2) %>% 
+  distinct(id, .keep_all = TRUE)
+
+rm(missing_confounders2)
+```
+
+#### Smoking
+
+I will take the new variable on smoking status
+
+```{r 1.19-missingness-smoke}
+table(data_analysis$oq_smoking_status, useNA = "ifany")
+```
+
+There are 199 missings in the smoking history, I will group this in an extra category.
+
+```{r 1.20-new-missing-cat-smoke}
+# Create new category for missings in smoke history
+data_analysis <- data_analysis %>% 
+  mutate(smoking_status = case_when(
+    is.na(oq_smoking_status) ~ "Unknown",
+    oq_smoking_status == 0 ~ "Never",
+    oq_smoking_status == 1 ~ "Former",
+    oq_smoking_status == 2 ~ "Current"
+  ))
+
+# Add missings in smoking history to missing dataset 
+missing_confounders2 <- data_analysis %>% 
+  filter(is.na(oq_smoking_status))
+
+missing_confounders <- missing_confounders %>% 
+  bind_rows(missing_confounders2) %>% 
+  distinct(id, .keep_all = TRUE)
+
+rm(missing_confounders2)
+```
+
+#### Alcohol consumption
+
+```{r 1.21-missingness-alcohol}
+table(data_analysis$oq_alc_per_wd, useNA = "ifany")
+
+data_analysis%$%table(oq_alc_per_wd, smoking_status, useNA = "ifany")
+```
+
+There are n = 199 missing observations, from the same respondents as for smoking history. Thus, I will group these obeservations in a new category, but there is no need to add these to the missing dataset.
+
+```{r 1.22-new-missing-cat-alcohol}
+# Create new category for missings in alcohol consumption
+data_analysis <- data_analysis %>% 
+  mutate(alcohol_weekly = case_when(
+    is.na(oq_alc_per_wd) ~ "Unknown",
+    oq_alc_per_wd == 8 ~ "16 or more drinks",
+    oq_alc_per_wd == 7 ~ "10 - 15 drinks",
+    oq_alc_per_wd == 6 ~ "6 - 9 drinks",
+    oq_alc_per_wd == 5 ~ "4 - 5 drinks",
+    oq_alc_per_wd == 4 ~ "3 drinks",
+    oq_alc_per_wd == 3 ~ "2 drinks",
+    oq_alc_per_wd == 2 ~ "1 drink",
+    oq_alc_per_wd == 1 ~ "0 drink"
+  ))
+```
+
+## Variables
+
+```{r 2.0-clean-environment-2, echo = FALSE}
+# Save missing confounders dataset for sensitivity analysis
+saveRDS(
+  missing_confounders, 
+  file = here::here("data", "obs_with_missing_confounders.RDS")
+  )
+# Select objects to keep
+keep_df <- c("data_analysis", "shifts_long")
+
+## Pick functions
+all_objs <- ls()
+is_func <- sapply(all_objs, function(x) is.function(get(x)))
+
+keep <- all_objs[is_func | all_objs %in% keep_df]
+
+# Remove everything else
+rm(list = setdiff(all_objs, keep))
+rm(all_objs, keep)
+```
+
+### Shift work
+
+```{r 2.1-shift-var-comparison}
+# Compare reported shift work history with updated
+data_analysis%$%table(night_shift_history, night_shifts_updated, useNA = "ifany") 
+```
+
+For the sample to be used for this analysis, there are no missings in the updated night shift variable. I will use this variable to run the descriptive statistics of the confounders. The missmatch between the reported and the updated and the reported night shift history was n = 377.
+
+### Confounders
+
+```{r 2.2-reorder-levels}
+# Reorder levels so "table 1" prints nicely
+data_analysis <- data_analysis %>% 
+  mutate(marital_status_grouped = if_else(
+    marital_status == "Divorced/separated" | 
+      marital_status == "Widowed/partner has died", 
+      "Divorced/separated, Widowed/partner has died",
+    marital_status
+  )) %>%
+  mutate(country_grouped = factor(
+    country_grouped,
+    levels = c("Austria", "Denmark", "Germany", "Greece", "Italy", "The Netherlands", 
+               "Poland", "Spain", "Other", "Unknown")
+  ),
+  education_grouped = factor(
+    education_grouped,
+    levels = c("Basic education", "High School and Vocational Training",
+               "Advanced Training and College", "University Degrees and beyond",
+               "Other")
+  ),
+  marital_status_grouped = factor(
+    marital_status_grouped,
+    levels = c("Single", "Married/living together with my partner", 
+               "Divorced/separated, Widowed/partner has died")
+  ),
+  income_satisfaction = factor(
+  income_satisfaction,
+  levels = c("Finding it very difficult on present income", 
+             "Finding it difficult on present income",
+             "Coping on present income",
+             "Living comfortably on present income",
+             "Prefer not to say")
+  ),
+  chronotype = factor(
+    chronotype,
+    levels = c ("Definitely morning", "Rather morning", "Intermediate", 
+                "Rather evening", "Definitely evening")
+  ),
+  alcohol_weekly = factor(
+    alcohol_weekly,
+    levels = c(
+      "0 drink",
+      "1 drink",
+      "2 drinks",
+      "3 drinks",
+      "4 - 5 drinks",
+      "6 - 9 drinks",
+      "10 - 15 drinks",
+      "16 or more drinks",
+      "Unknown"
+    )
+  )
+  )
+```
+
+```{r 2.3-confounders-description}
+# Table 1
+confounders <- c("oq_age", "gender", "country_grouped", "education_grouped",
+                 "marital_status", "income_satisfaction", "chronotype", 
+                 "bmi_imputed", "smoking_status",
+                 "alcohol_weekly")
+t1_rows <- paste(confounders, collapse = " + ")
+
+# Construct the formula as a string, including the conditioning variable after |
+formula_string <- paste("~", t1_rows, "| night_shifts_updated")
+
+# Convert to formula object
+formula_obj <- as.formula(formula_string)
+
+table1(formula_obj, data = data_analysis)
+```
+
+As can be seen in the preliminary Table 1, former nigh shift workers are slightly older and were more likely to live in Greece, The Netherlands or Poland. Current night shift workers were more likely to live in Austria and have later chronotypes and to report higher income satisfaction. Always day workers are more likely to be female, report higher education levels, have morning chronotypes and lower BMI, and report lower ocupational physical activity.
+
+### Schedules
+
+#### Shift duration
+
+In addition to what has been exposed above, two respondents required manual review. One had complete sleep information for only one of their two reported shifts, likely due to a questionnaire branching-logic issue, and was excluded from the analysis. Another reported a night shift with a zero-length schedule (00:00 to 00:00) and no associated sleep information, which likely indicates no such shift actually occurred; only that specific shift, not the respondent, was excluded.
+
+```{r 2.4-cc-schedules}
+# Keep only shifts of participants included in association analysis 
+data_analysis <- data_analysis %>% 
+  filter(id != 211068)
+
+ids_cc <- data_analysis %>% 
+  select(id) %>% 
+  pull()
+
+# Create new categorical variable for shift types
+schedules_cc <- shifts_long %>% 
+  filter(id %in% ids_cc) %>% 
+  filter(!(id == 202719 & shift_number == 4)) %>% 
+  mutate(shift_type = case_when( # add factor variable of shift type
+    is_early_shift ~ "Early",
+    is_late_shift ~ "Late",
+    is_night_shift ~ "Night",
+    .default = NA
+  )) %>% 
+  mutate(shift_type = if_else( # fix missings of variable
+    (is.na(is_early_shift) | !is_early_shift)&
+     is.na(is_late_shift)&
+      is.na(is_night_shift),
+    case_when(
+      shift_start_clean >= as_hms("02:01:00") & 
+        shift_start_clean <= as_hms("09:59:00")
+      ~ "Early",
+      shift_duration_clean == 24
+      ~"Night",
+      .default = "Late"
+    ),
+    shift_type
+  ))
+```
+
+```{r 2.5-schedules-description}
+hist(schedules_cc$shift_duration_clean)
+type_list <- c("is_early_shift", "is_late_shift", "is_night_shift")
+table_duration_by_type(type_list, schedules_cc)
+```
+
+Night shifts are the longest, with the highest variation in duration also.
+
+# Plot of schedules
+
+```{r 2.6-prepare-plot-dataset}
+# New plot datataset with rounded start and end times
+schedules_plot <- schedules_cc |>
+  mutate(
+    shift_start_clean = if_else(
+      shift_start_clean == as_hms("24:00:00"),
+      as_hms("00:00:00"),
+      shift_start_clean
+      ),
+     shift_end_clean = as_hms(
+      if_else(
+        shift_start_clean >= shift_end_clean |
+          shift_duration_clean > 24,
+        as.numeric(shift_end_clean) + 86400,  # Add 24 hours in seconds
+        as.numeric(shift_end_clean)
+      )
+    )
+  ) |>
+  mutate(
+    shift_start_rounded = round_hms_to_nearest(
+      shift_start_clean,
+      interval_hours = 1.0
+    ),
+    shift_end_rounded = round_hms_to_nearest(
+      shift_end_clean,
+      interval_hours = 1.0
+    )
+  )|>
+  mutate(
+    shift_start_rounded = as_hms(
+      if_else(
+        shift_start_rounded >= as_hms("24:00:00") & 
+          shift_end_rounded > as_hms("24:00:00"),
+        as.numeric(shift_start_rounded) - 86400, # Add 24 hours in seconds
+        as.numeric(shift_start_rounded)
+      )
+      ),
+     shift_end_rounded = as_hms(
+      if_else(
+        (shift_start_rounded == as_hms("00:00:00") |
+           shift_start_rounded >= as_hms("24:00:00")) & 
+          shift_end_rounded > as_hms("24:00:00"),
+        as.numeric(shift_end_rounded) - 86400,  # Substract 24 hours in seconds
+        as.numeric(shift_end_rounded)
+      )
+    )
+  ) 
+```
+
+```{r 2.7-shifts-plot-function}
+# Define basic plot function
+schedules_plot_coloured <- function(dataset, colour){
+  ggplot(
+    dataset, 
+    aes(
+      y = y_order 
+      )
+    ) +
+    geom_segment(
+      aes(
+        x = shift_start_rounded, 
+        xend = shift_end_rounded,
+        y = y_order,
+        yend = y_order,
+        color = {{colour}}
+        ),
+      size = 0.5
+      ) +
+    geom_point(
+      aes(
+        x = shift_start_rounded
+        ),
+      color = "#0e668b",
+      size = 1) +
+    geom_point(
+      aes(
+        x = shift_end_rounded
+        ),
+      color = "#b22222",
+      size = 1) +
+     scale_x_time(
+       breaks = breaks_width("3 hours"),
+       labels = time_format("%H:%M")
+       ) +
+    labs(
+      x = "Time of Day",
+      y = "",
+      caption = "Dumbbell-style plot showing start (dark blue points) and end (red points) times of each of the shift schedules (one line per distinct schedule). Shift start and end times were rounded to the nearest hour."
+      ) +
+    theme(
+      legend.title = element_text(size = 10),
+      legend.text = element_text(size=10),
+      panel.grid.major.x = element_line(
+        colour = "darkgray",
+        linewidth = 0.3
+      ),
+      panel.grid.minor.x = element_line(
+        colour = "gray",
+        linewidth = 0.2
+      ),
+      panel.background = element_blank()
+    )
+  }
+```
+
+```{r 2.8-schedules-plot-by-type-and-times-reported, warning=FALSE}
+# Define dataset for first plot (colour by nr of time)
+schedules_plot_1 <- schedules_plot |>
+  select(shift_start_rounded, shift_end_rounded, shift_type) |>
+  group_by(shift_type, shift_start_rounded, shift_end_rounded) |> 
+  summarise(n = n(), .groups = "drop") |> 
+  mutate(
+    n_factor = factor(
+      cut(
+        n,
+        breaks = c(0, 49, 99, 1000),
+        labels = c("<50", "50-99", "100+")
+      )
+  )
+  ) |>
+  arrange(shift_start_rounded) |>
+  mutate(y_order = 2*row_number()) |> # Create new var so shifts appear ordered
+                                       # by start time
+  ungroup() 
+
+# Plot stratified by shift type and depicting nr of times shift was reported 
+schedules_plot_coloured(schedules_plot_1, colour = n_factor)+
+  scale_y_continuous(breaks = NULL) +
+  facet_wrap(
+    ~ shift_type,
+    scales = "free_y",
+    ncol = 1,  # puts each shift_type in its own row
+    strip.position = "left" 
+  ) +
+  labs(
+    title = "Distinct Shift Schedules",
+    color = "Times shift was reported"
+  ) +
+  theme(strip.placement = "outside", strip.text.y.left = element_text(angle = 0))
+```
+
+```{r 2.9-schedules-plot, warning=FALSE}
+schedules_plot_2 <- schedules_plot |>
+  select(shift_start_rounded, shift_end_rounded, shift_type) |>
+  arrange(shift_start_rounded, shift_end_rounded) |>
+  ungroup() |>
+  mutate(y_order = row_number()) 
+
+schedules_plot_coloured(schedules_plot_2, colour = shift_type)+
+  scale_y_continuous(breaks = seq(0, 12400, by = 1000))+
+  labs(
+    title = "Shift schedules (n = 12,361)",
+    color = "Type of shift"
+  )+
+  ylab("Nr. of shifts")
+```
+
+[**Conclusions**]{.underline}
+
+- Early shifts were the most commonly reported schedules, followed by night shifts.
+
+- Start times of night shifts are scattered throughout the day.
+
+- Night shifts are longer than early and late shifts.
+
+#### Association between start and end times, shift duration and frequencies
+
+##### Times as circular variables
+
+```{r 2.10-circular-times}
+# Transform times into angles to account for circular nature of time (e.g. 01:00 being
+# closer to 23:00 than to 05:00)
+circular_schedules <- schedules_cc |>
+  mutate(
+    shift_start_num = as.numeric(shift_start_clean) / 3600,
+    shift_end_num = as.numeric(shift_end_clean) / 3600,
+    
+    shift_start_angle = (2 * pi * shift_start_num / 24), 
+    shift_end_angle   = (2 * pi * shift_end_num / 24),
+    
+    shift_start_sin = sin(shift_start_angle),
+    shift_start_cos = cos(shift_start_angle),
+    
+    shift_end_sin   = sin(shift_end_angle),
+    shift_end_cos   = cos(shift_end_angle)
+  )
+```
+
+```{r 2.11-check-transformation}
+# Create labels for each hour on the clock
+hour_labels <- data.frame(
+  hour = 0:23
+) |>
+  mutate(
+    angle = (2 * pi * hour / 24),
+    x = sin(angle), # instead of cos to rotate labels
+    y = cos(angle), # instead of sin to rotate labels
+    label = as.character(hour)
+  ) |> 
+  mutate(
+    x = 1.1 * x,
+    y = 1.1 * y
+  )
+
+# Plot angular start times
+ggplot(
+  circular_schedules, 
+  aes(
+    x = shift_start_sin, 
+    y = shift_start_cos
+    )) +
+  geom_point(
+    aes(
+      color = shift_type
+    ),
+    alpha = 1) +
+  geom_text(data = hour_labels, aes(x = x, y = y, label = label), 
+            color = "black", size = 3.5, fontface = "bold") +
+  coord_fixed() +
+  theme_void()+
+  labs(title = "Circular transformation of shift start times")
+
+# Plot angular end times
+ggplot(
+  circular_schedules, 
+  aes(
+    x = shift_end_sin, 
+    y = shift_end_cos
+    )) +
+  geom_point(
+    aes(
+      color = shift_type
+    ),
+    alpha = 1) +
+  geom_text(data = hour_labels, aes(x = x, y = y, label = label), 
+            color = "black", size = 3.5, fontface = "bold") +
+  coord_fixed() +
+  theme_void()+
+  labs(title = "Circular transformation of shift end times")
+```
+
+```{r 2.12-correlation-matrix, warning=FALSE, message=FALSE}
+# Dataset for correlation matrix
+correlation_level_1 <- schedules_cc |> 
+  select(matches(c("clean", "freq", "log", "sqrt"))) |>  
+  select(-shift_freq_month_clean) |>  
+  mutate(across(where(is_hms),
+                ~as.numeric(.)/3600))
+
+# Set variable labesl for matrix
+columnLabels <- c("Duration", "Start time", "End time", "Frequency (relative)", "Log duration" , "Root square duration")
+
+# Plot matrix
+matrix1 <- ggpairs(correlation_level_1)
+
+matrix1
+```
+
+There seems to be no strong correlation between the shift level variables.
+
+#### Shift frequency
+
+```{r 2.13-shift-freq}
+# Check missings in frequency variables
+summary(circular_schedules$shift_freq_rel)
+summary(circular_schedules$shift_freq_month_clean) 
+```
+
+There are more missings for the absolute frequency. I will check the missings in the relative frequency variable, to check if it is possible to impute some of them.
+
+```{r 2.14-shift-freq-missing-check}
+# Rename number of shifts variable
+data_analysis <- data_analysis |> 
+  rename(number_of_shifts = oq_number_of_shifts)
+
+# Extract id
+ids_missing_freq <- circular_schedules |> 
+  filter(is.na(shift_freq_rel)) |> 
+  pull(id)
+
+# Check frequency and nr of shifts
+data_analysis |> 
+  filter(id %in% ids_missing_freq) |> 
+  select(number_of_shifts) |>  
+  summary()
+
+circular_schedules |>  
+  filter(id %in% ids_missing_freq) |>  
+  select(shift_freq_month_clean) |> 
+  summary()
+```
+
+All of these participants reported only one type if shift, so I will assume that is their only shift and replace the relative frequency with 1.0
+
+```{r 2.15-shift-freq-missing-cleaning}
+circular_schedules <- circular_schedules |> 
+  mutate(shift_freq_rel_clean = as.numeric(if_else(
+    is.na(shift_freq_rel),
+    1.00,
+    shift_freq_rel
+  ))) 
+
+summary(circular_schedules$shift_freq_rel_clean)
+```
+
+```{r 2.16-clean-environment, include = FALSE, echo = FALSE}
+rm(ids_missing_freq)
+```
+
+There are some 0 values. I will check these
+
+```{r 2.17-shift-freq-zero-check}
+# Extract id
+ids_null_freq <- circular_schedules |> 
+  filter(shift_freq_rel == 0) |> 
+  pull(id)
+
+# Check frequency and nr of shifts
+data_analysis |>  
+  filter(id %in% ids_null_freq) |>  
+  select(number_of_shifts) |> 
+  summary()
+
+circular_schedules |> 
+  filter(id %in% ids_null_freq) |>  
+  select(shift_freq_month_clean) |> 
+  summary()
+```
+
+There is 1 participants with 0 in relative frequency. This correspond to a night shift, the participant reported not working shifts currently and the frequencies and duration reported already add up to about 30h a week. Thus, I will delete this shift.
+
+```{r 2.18-shift-freq-zero-cleaning}
+# Delete shift
+circular_schedules <- circular_schedules |> 
+  filter(!(id == ids_null_freq & shift_freq_rel_clean ==0 ))
+```
+
+Next, I will check that relative frequencies add up to 1.
+
+```{r 2.19-check-relative-freq}
+# Check sum of relative frequencies
+sum_rel_freq <- circular_schedules |>  
+  select(id, shift_freq_rel_clean) |> 
+  group_by(id) |>  
+  summarise(sum = sum(shift_freq_rel_clean))
+
+summary(sum_rel_freq)
+```
+
+All relative frequencies add up to one.
+
+```{r 2.20-clean-environment}
+rm(sum_rel_freq)
+```
+
+#### Number of different shifts
+
+First, I will check that all the shifts reported by a participant are unique, and then update the `number_of_shifts` variable.
+
+```{r 2.21-duplicates-check}
+# Check if there are duplicates
+duplicates <- circular_schedules |> 
+  group_by(id, shift_start_clean, shift_end_clean) |> 
+  filter(n() > 1) |> 
+  ungroup()
+
+if (nrow(duplicates) == 0){
+  print("There are no duplicates in schedules")
+  number_of_shifts_df <- circular_schedules |>  
+    group_by(id) |> 
+    summarise(number_of_shifts = n())
+  rm(duplicates)
+  data_analysis <- data_analysis |> 
+    select(-number_of_shifts) |> 
+    left_join(number_of_shifts_df, by = join_by(id))
+  rm(number_of_shifts_df)
+} else{
+  stop("There are duplicates in schedules. Check before continuing.")
+}
+```
+
+```{r 2.22-nr-shifts-distribution}
+# Check distribution
+histogram(data_analysis, number_of_shifts, bins = 4)
+summary(data_analysis$number_of_shifts)
+```
+
+It is a low-cardinality discrete variable, so it might make sense to recode it as an (ordered) factor later on.
+
+### Shift work metrics
+
+#### Duration of shift work (former and current)
+
+```{r 2.23-sw-duration}
+histogram(data_analysis, years_worked_ns, bin = 20)
+```
+
+The distribution is right skewed, so it might need to be log or square root transformed.
+
+```{r 2.23.1-sw-duration-log}
+histogram(data_analysis, log1p(years_worked_ns), bin = 20)
+```
+
+##### Former shift workers only
+
+```{r 2.24-sw-duration-former}
+# Rename variable
+data_analysis <- data_analysis |>  
+  rename(years_worked_ns_former = oq_years_ns_former)
+
+# Histogram
+histogram(data_analysis, years_worked_ns_former, bin = 5)
+```
+
+As these variable was collected using a multiple choice variable and transformed later on, there are a reduced number of bars. However, it also seems to be right skewed.
+
+```{r 2.24.1-sw-duration-former-log}
+# Check distribution with log-transformation
+histogram(data_analysis, log1p(years_worked_ns_former), bin = 5)
+```
+
+##### Current shift workers only
+
+```{r 2.25-sw-duration-current}
+# Rename variable
+data_analysis <- data_analysis |> 
+  rename(years_worked_ns_current = oq_ns_years_4)
+
+# Histogram
+histogram(data_analysis, years_worked_ns_current, bin = 20)
+```
+
+This variable is also right skewed.
+
+```{r 2.25.1-sw-duration-current-log}
+# Check distribution with log-transformation
+histogram(data_analysis, log1p(years_worked_ns_current), bin = 20)
+```
+
+#### Years since cessation (former)
+
+```{r 2.26-cessation-distribution}
+# Rename variable
+data_analysis <- data_analysis  |>  
+  rename(years_since_last_ns = oq_ns_years_2)
+
+# Histogram
+histogram(data_analysis, years_since_last_ns, bin = 20)
+summary(data_analysis$years_since_last_ns)
+```
+
+The variable is right skewed, so a log transformation might be needed.
+
+```{r 2.26.1-cessation-log}
+histogram(data_analysis, log1p(years_since_last_ns), bin = 20)
+```
+
+#### Rotation speed (current)
+
+```{r 2.27-speed-rotation-summary}
+# Check if there are missings for shift workers with 2+ shifts
+data_analysis |>
+  filter(number_of_shifts >= 2) |>
+  select(oq_shift_rotation) |>
+  summary()
+```
+
+There are no missings for subjects with 2 or more shifts. I will rename this variable and transform it into a factor, adding subjects with 1 shift in a "Not applicable" category.
+
+```{r 2.28-new-rotation-var}
+# Create new rotation variable
+data_analysis <- data_analysis |> 
+  mutate(shift_rotation_speed = as_factor(case_when(
+    number_of_shifts == 1 ~ "Not applicable",
+    oq_shift_rotation == 0 ~ "Daily change",
+    oq_shift_rotation == 1 ~ "Change every 2-4 days",
+    oq_shift_rotation == 2 ~ "Change every week",
+    oq_shift_rotation == 3 ~ "Change every 2-3 weeks",
+    oq_shift_rotation == 4 ~ "Other",
+    oq_shift_rotation == 5 ~ "Rotation speed varies"
+  )))
+
+summary(data_analysis$shift_rotation_speed)
+```
+
+#### Rotation direction
+
+```{r 2.29-direction-rotation-summary}
+# Check if there are missings for shift workers with 3+ shifts
+data_analysis |> 
+  filter(number_of_shifts > 2) |>  
+  select(oq_shift_rotation_2.x) |>  #identical to oq_shift_rotation_2.y
+  summary()
+```
+
+Even for participants with 3+ shifts, this variable has a lot of missing values, so I will exclude it from the analysis.
+
+#### Weekly working hours
+
+```{r 2.30-working-hours-summary}
+# Check distribution weekly working hours
+summary(data_analysis$oq_work_hours)
+histogram(data_analysis, oq_work_hours, bins = 12)
+```
+
+There are n = 71 missing values. Since this variable is key for the risk analysis, these observations need to be excluded. Otherwise, the variable is only slightly right skewed and well centered around 40h. Thus, I will not transform it, although I might have to check the residuals if running regression using this variable and/or categorise it.
+
+```{r 2.31-exclude-missings-rename-work-hours}
+# Keep only observations with info on working hours
+data_analysis <- data_analysis |>  
+  filter(!is.na(oq_work_hours)) |> 
+  rename(working_hours = oq_work_hours)
+```
+
+### Sleep duration
+
+```{r 3.1-sleep-duration-summary}
+# Explore sleep durations
+data_analysis |>  
+  select(matches("sleep_duration")) |> 
+  summary() 
+```
+
+Some respondents have reported very short sleep durations (\<3h) or not provided data on sleep schedules. I will exclude those for which all sleep durations are \<3h (n = 56, resulting dataset with n = 6245).
+
+```{r 3.2-exclude-short-sleepers}
+# Exclude repondets with all sleep durations missing or <3h
+data_analysis <- data_analysis |>  
+  filter(if_any(matches("sleep_duration"), ~ . >= 3))
+
+#Summary
+data_analysis |> 
+  select(matches("sleep_duration")) |> 
+  summary()
+```
+
+#### Distributions of sleep duration variables
+
+```{r 3.3-histograms-sleep, warning = FALSE}
+# Visualise distribution of sleep variables
+## Store sleep variable names in a vector
+sleep_duration_vars <- data_analysis |>  
+  select(matches("sleep_duration")) |> 
+  names() |> 
+  syms()
+
+## Plot histogramos of variables and store them in a list
+histograms <- lapply(sleep_duration_vars, function(var) {
+  histogram(data_analysis, !!var, bin = 12)
+})
+
+## Visualise histograms
+combined_histograms <- wrap_plots(histograms) + plot_layout(ncol = 3)  
+print(combined_histograms)
+```
+
+Distributions look somewhat normal, although some of them are left skewed.
+
+#### Sleep duration by type of day
+
+To calculate summary statistics of sleep duration by type of day, I will pivot all variables in a long format dataset and stratify by type of day before calculating statistics or present datasets.
+
+```{r 3.4-pivot-sleep-long-format}
+# Function to extract sleep information for each shift
+extract_sleep_info <- function(shift_num, shift_type) {
+  #Define vars
+  start_var <- paste0("oq_", shift_type, "_bedtime", shift_num)
+  end_var <- paste0("oq_", shift_type, "_wake_time", shift_num)
+  duration_var <- paste0("oq_", shift_type, "_sleep_duration", shift_num)
+  quality_var <- paste0("oq_", shift_type, "_sleep_qual", shift_num)
+
+  # Extract variables and values
+  tryCatch({ # Access columns and handle missing ones
+    data_analysis |> 
+      select(
+        id,
+        bedtime = !!sym(start_var),
+        wake_time = !!sym(end_var),
+        sleep_duration = !!sym(duration_var),
+        sleep_quality = !!sym(quality_var)
+      ) |> 
+      mutate(
+        shift_number = as.numeric(case_when(
+          shift_type %in% c("wf_dw", "wf") ~ 0,
+          shift_num == "" | shift_type == "wd" ~ 1,
+          TRUE ~ as.numeric(gsub("_", "", shift_num))
+        )),
+        type_of_day = as_factor(case_when(
+          shift_type == "wd" ~ "Work day (fixed schedule)",
+          shift_type == "es" ~ "Early shift",
+          shift_type == "ls" ~ "Late shift",
+          shift_type == "ns" ~ "Night shift",
+          shift_type == "wf_dw" ~ "Day off (fixed schedule)",
+          shift_type == "wf" ~ "Day off (shift worker)"
+        )),
+        # Specify order
+        type_of_day = factor(type_of_day, levels = c(
+          "Early shift",
+          "Late shift",
+          "Night shift",
+          "Day off (shift worker)",
+          "Work day (fixed schedule)",
+          "Day off (fixed schedule)"
+        ))
+      ) 
+  }, error = function(e) {
+    # Return NULL if columns don't exist
+    NULL
+  })
+}
+
+# Define shift numbers and types
+shift_nums <- c("", "_2", "_3", "_4")
+shift_types <- c("wd", "wf_dw", "es", "ls", "ns", "wf")
+
+# Generate combinations
+combinations <- expand.grid(shift_num = shift_nums, shift_type = shift_types,
+                            stringsAsFactors = FALSE)
+
+# Apply function across combinations
+sleep_data_list <- pmap(combinations, extract_sleep_info)
+
+# Combine all non-null results into one long dataset
+sleep_long <- bind_rows(sleep_data_list) |> 
+  drop_na(sleep_duration)
+```
+
+```{r 3.5-sleep-summary}
+sleep_long |>  
+  group_by(type_of_day) %>% 
+  summarise(across(
+    sleep_duration,
+    list(
+      mean = ~mean(.x, na.rm = TRUE),
+      median = ~median(.x, na.rm = TRUE),
+      sd = ~sd(.x, na.rm = TRUE),
+      min = ~min(.x, na.rm = TRUE),
+      max = ~max(.x, na.rm = TRUE)
+    )
+  ))
+```
+
+```{r 3.6-histogram-sleep-dur-by-shift-type, fig.show='hold'}
+wrapped_histogram(
+  sleep_long, sleep_duration, type_of_day, bins = 12, rows = 5
+  )
+```
+
+### Save data
+
+```{r 4.0-save-data, include=FALSE}
+# Extract final ids
+final_ids <- data_analysis |> 
+  pull(id)
+
+# Keep only schedules of thes
+circular_schedules <- circular_schedules |>  
+  filter(id %in% final_ids)
+
+# Save
+saveRDS(circular_schedules, file = here::here("data", "circular_schedules"))
+saveRDS(data_analysis, file = here::here("data", "data_analysis"))
+```
+
+## Session information
+
+```{r 4.1-session-info}
+sessionInfo()
+```
